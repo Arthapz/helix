@@ -34,6 +34,7 @@ use helix_view::Editor;
 use tui::text::{Span, Spans};
 use std::path::Path;
 use std::{error::Error, path::PathBuf};
+use helix_view::theme::Style;
 
 struct Utf8PathBuf {
     path: String,
