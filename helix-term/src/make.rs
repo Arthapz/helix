@@ -46,23 +46,30 @@ pub fn make_picker(cx: &Context, root: PathBuf) -> MakePicker {
             }
             .into()
         }),
-        PickerColumn::new("path", |entry: &Entry, data: &MakePickerData| {
-            let path = match entry.location.path.strip_prefix(&data.root) {
-                Ok(path) => path.to_str(),
-                Err(_) => entry.location.path.to_str(),
-            };
-            match path {
-                Some(str) => str.into(),
-                None => "".into(),
-            }
-        }),
         PickerColumn::new("message", |entry: &Entry, _data: &MakePickerData| {
             entry.msg.clone().into()
         }),
+        // PickerColumn::new("path", |entry: &Entry, data: &MakePickerData| {
+        //     let path = match entry.location.path.strip_prefix(&data.root) {
+        //         Ok(path) => path.to_str(),
+        //         Err(_) => entry.location.path.to_str(),
+        //     };
+        //     match path {
+        //         Some(str) => str.into(),
+        //         None => "".into(),
+        //     }
+        // }),
     ];
 
     Picker::new(columns, 0, options, data, move |cx, item, action| {
         goto_location(cx, &item.location.path, &item.location.line, action);
+    })
+    .with_preview(move |_editor, item| {
+        let line = Some((
+            item.location.line as usize,
+            item.location.line as usize,
+        ));
+        Some((item.location.path.as_path().into(), line))
     })
 }
 
