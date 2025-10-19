@@ -109,14 +109,14 @@ fn parse_with_regex(source: &str, regex: &str) -> Vec<Entry> {
 fn parse_rust(source: &str) -> Vec<Entry> {
     parse_with_regex(
         source,
-        r"^(?P<severity>help|warning|error)(?:\[.+\])?:?\s(?P<message>.+)\n\s+-->\s(?P<path>[^:\n\s]+):(?P<line>\d+):(\d+)$",
+        r"^(?P<severity>help|warning|error)(?:\[.+\])?:?\s(?P<message>.+)\n\s+-->\s(?P<path>([A-Z]:)?[^:\n\s]+):(?P<line>\d+):(\d+)$",
     )
 }
 
 fn parse_gcc(source: &str) -> Vec<Entry> {
     parse_with_regex(
         source,
-        r"^(?P<path>[^:\n\s]+)(?::(?P<line>\d+))?(?::\d+)?(?::\([^)]+\))?:\s(?P<severity>error|warning|note)?:?\s?(?P<message>.+)$",
+        r"^(?P<path>([A-Z]:)?[^:\n\s]+)(?::(?P<line>\d+))?(?::\d+)?(?::\([^)]+\))?:\s(?P<severity>error|warning|note)?:?\s?(?P<message>.+)$",
     )
 }
 
