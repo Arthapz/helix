@@ -1,0 +1,767 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 690d50d0a554..3619f48663a5 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1585,6 +1585,7 @@ dependencies = [
+  "once_cell",
+  "open",
+  "pulldown-cmark",
++ "regex",
+  "same-file",
+  "serde",
+  "serde_json",
+diff --git a/helix-term/Cargo.toml b/helix-term/Cargo.toml
+index f47cec4bf1be..5b7126a3c0ef 100644
+--- a/helix-term/Cargo.toml
++++ b/helix-term/Cargo.toml
+@@ -95,6 +95,7 @@ dashmap = "6.0"
+ 
+ [target.'cfg(windows)'.dependencies]
+ crossterm = { version = "0.28", features = ["event-stream"] }
++regex = "1"
+ 
+ [target.'cfg(not(windows))'.dependencies]  # https://github.com/vorner/signal-hook/issues/100
+ signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
+diff --git a/helix-term/src/commands.rs b/helix-term/src/commands.rs
+index 430d4430aaeb..ad1a922abe8d 100644
+--- a/helix-term/src/commands.rs
++++ b/helix-term/src/commands.rs
+@@ -3,6 +3,7 @@ pub(crate) mod lsp;
+ pub(crate) mod syntax;
+ pub(crate) mod typed;
+ 
++use crate::make::make_picker;
+ pub use dap::*;
+ use futures_util::FutureExt;
+ use helix_event::status;
+@@ -615,6 +616,7 @@ impl MappableCommand {
+         goto_prev_tabstop, "Goto next snippet placeholder",
+         rotate_selections_first, "Make the first selection your primary one",
+         rotate_selections_last, "Make the last selection your primary one",
++        make_cmd_picker, "MAKE PICKER",
+     );
+ }
+ 
+@@ -2450,6 +2452,39 @@ fn make_search_word_bounded(cx: &mut Context) {
+     }
+ }
+ 
++pub fn goto_location(
++    cx: &mut compositor::Context,
++    path: &PathBuf,
++    line_num: &usize,
++    action: Action,
++) {
++    let doc = match cx.editor.open(path, action) {
++        Ok(id) => doc_mut!(cx.editor, &id),
++        Err(e) => {
++            cx.editor
++                .set_error(format!("Failed to open file '{}': {}", path.display(), e));
++            return;
++        }
++    };
++
++    let line_num = *line_num;
++    let view = view_mut!(cx.editor);
++    let text = doc.text();
++    if line_num >= text.len_lines() {
++        cx.editor.set_error(
++            "The line you jumped to does not exist anymore because the file has changed.",
++        );
++        return;
++    }
++    let start = text.line_to_char(line_num);
++    let end = text.line_to_char((line_num + 1).min(text.len_lines()));
++
++    doc.set_selection(view.id, Selection::single(start, end));
++    if action.align_view(view, doc.id()) {
++        align_view(doc, view, Align::Center);
++    }
++}
++
+ fn global_search(cx: &mut Context) {
+     #[derive(Debug)]
+     struct FileResult {
+@@ -2644,31 +2679,7 @@ fn global_search(cx: &mut Context) {
+         [],
+         config,
+         move |cx, FileResult { path, line_num, .. }, action| {
+-            let doc = match cx.editor.open(path, action) {
+-                Ok(id) => doc_mut!(cx.editor, &id),
+-                Err(e) => {
+-                    cx.editor
+-                        .set_error(format!("Failed to open file '{}': {}", path.display(), e));
+-                    return;
+-                }
+-            };
+-
+-            let line_num = *line_num;
+-            let view = view_mut!(cx.editor);
+-            let text = doc.text();
+-            if line_num >= text.len_lines() {
+-                cx.editor.set_error(
+-                    "The line you jumped to does not exist anymore because the file has changed.",
+-                );
+-                return;
+-            }
+-            let start = text.line_to_char(line_num);
+-            let end = text.line_to_char((line_num + 1).min(text.len_lines()));
+-
+-            doc.set_selection(view.id, Selection::single(start, end));
+-            if action.align_view(view, doc.id()) {
+-                align_view(doc, view, Align::Center);
+-            }
++            goto_location(cx, path, line_num, action);
+         },
+     )
+     .with_preview(|_editor, FileResult { path, line_num, .. }| {
+@@ -5380,6 +5391,12 @@ fn rotate_selections_last(cx: &mut Context) {
+     doc.set_selection(view.id, selection);
+ }
+ 
++fn make_cmd_picker(cx: &mut Context) {
++    let root = find_workspace().0;
++    let picker = make_picker(cx, root);
++    cx.push_layer(Box::new(overlaid(picker)));
++}
++
+ #[derive(Debug)]
+ enum ReorderStrategy {
+     RotateForward,
+diff --git a/helix-term/src/commands/lsp.rs b/helix-term/src/commands/lsp.rs
+index 0494db3e7bb0..4674f69e57ff 100644
+--- a/helix-term/src/commands/lsp.rs
++++ b/helix-term/src/commands/lsp.rs
+@@ -32,7 +32,9 @@ use crate::{
+     ui::{self, overlay::overlaid, FileLocation, Picker, Popup, PromptEvent},
+ };
+ 
+-use std::{cmp::Ordering, collections::HashSet, fmt::Display, future::Future, path::Path};
++use std::{
++    cmp::Ordering, collections::HashSet, fmt::Display, future::Future, path::Path, path::PathBuf,
++};
+ 
+ /// Gets the first language server that is attached to a document which supports a specific feature.
+ /// If there is no configured language server that supports the feature, this displays a status message.
+@@ -59,12 +61,22 @@ macro_rules! language_server_with_feature {
+ /// A wrapper around `lsp::Location` that swaps out the LSP URI for `helix_core::Uri` and adds
+ /// the server's  offset encoding.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+-struct Location {
++pub struct Location {
+     uri: Uri,
+     range: lsp::Range,
+     offset_encoding: OffsetEncoding,
+ }
+ 
++impl Location {
++    pub fn new(path: PathBuf, range: lsp::Range, offset_encoding: OffsetEncoding) -> Self {
++        Self {
++            uri: path.into(),
++            range: range,
++            offset_encoding: offset_encoding,
++        }
++    }
++}
++
+ fn lsp_location_to_location(
+     location: lsp::Location,
+     offset_encoding: OffsetEncoding,
+@@ -109,7 +121,7 @@ fn location_to_file_location(location: &Location) -> Option<FileLocation<'_>> {
+     Some((path.into(), line))
+ }
+ 
+-fn jump_to_location(editor: &mut Editor, location: &Location, action: Action) {
++pub fn jump_to_location(editor: &mut Editor, location: &Location, action: Action) {
+     let (view, doc) = current!(editor);
+     push_jump(view, doc);
+ 
+diff --git a/helix-term/src/commands/typed.rs b/helix-term/src/commands/typed.rs
+index 4831b9382f7c..bc4b996c9a16 100644
+--- a/helix-term/src/commands/typed.rs
++++ b/helix-term/src/commands/typed.rs
+@@ -3,6 +3,7 @@ use std::io::BufReader;
+ use std::ops::{self, Deref};
+ 
+ use crate::job::Job;
++use crate::make::{self};
+ 
+ use super::*;
+ 
+@@ -2640,6 +2641,44 @@ fn noop(_cx: &mut compositor::Context, _args: Args, _event: PromptEvent) -> anyh
+     Ok(())
+ }
+ 
++fn make(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
++    if event != PromptEvent::Validate {
++        return Ok(());
++    }
++
++    let shell = cx.editor.config().shell.clone();
++    // TODO(szulf): for now i take the command each time the :make is run,
++    // can i maybe just take it once and store it on Editor
++    if cx.editor.make_cmd.is_none() {
++        let workspace = find_workspace().0;
++        let contains = cx.editor.config().make_cmds.contains_key(&workspace);
++        if !contains {
++            return Err(anyhow!("No make command set for current workspace."));
++        }
++        cx.editor.make_cmd = Some(cx.editor.config().make_cmds[&workspace].clone());
++    }
++    let command = cx.editor.make_cmd.clone().unwrap();
++
++    let callback = async move {
++        let output = shell_impl_async(&shell, &command.command, None).await?;
++        let call: job::Callback = Callback::EditorCompositor(Box::new(
++            move |editor: &mut Editor, _compositor: &mut Compositor| {
++                let entries = make::parse(&command.format_type, output.as_str());
++                let entries_count = entries.len();
++                editor.make_list.set(entries);
++                editor.set_status(format!(
++                    "Command run. Filled make list with {} entries.",
++                    entries_count
++                ));
++            },
++        ));
++        Ok(call)
++    };
++    cx.jobs.callback(callback);
++
++    Ok(())
++}
++
+ /// This command accepts a single boolean --skip-visible flag and no positionals.
+ const BUFFER_CLOSE_OTHERS_SIGNATURE: Signature = Signature {
+     positionals: (0, Some(0)),
+@@ -3666,6 +3705,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
+             ..Signature::DEFAULT
+         },
+     },
++    TypableCommand {
++        name: "make",
++        aliases: &["mk"],
++        doc: "Executes the config specified make command and fills the make picker with its output.",
++        fun: make,
++        completer: SHELL_COMPLETER,
++        signature: Signature {
++            positionals: (0, Some(0)),
++            ..Signature::DEFAULT
++        },
++    },
+ ];
+ 
+ pub static TYPABLE_COMMAND_MAP: Lazy<HashMap<&'static str, &'static TypableCommand>> =
+diff --git a/helix-term/src/keymap/default.rs b/helix-term/src/keymap/default.rs
+index 5bbbd3f40429..38bab2d15c1e 100644
+--- a/helix-term/src/keymap/default.rs
++++ b/helix-term/src/keymap/default.rs
+@@ -292,6 +292,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
+             "C" => toggle_block_comments,
+             "A-c" => toggle_line_comments,
+             "?" => command_palette,
++            "m" => make_cmd_picker,
+         },
+         "z" => { "View"
+             "z" | "c" => align_view_center,
+diff --git a/helix-term/src/lib.rs b/helix-term/src/lib.rs
+index 75b67479b411..a33b7bf76578 100644
+--- a/helix-term/src/lib.rs
++++ b/helix-term/src/lib.rs
+@@ -10,6 +10,7 @@ pub mod events;
+ pub mod health;
+ pub mod job;
+ pub mod keymap;
++pub mod make;
+ pub mod ui;
+ 
+ use std::path::Path;
+diff --git a/helix-term/src/make.rs b/helix-term/src/make.rs
+new file mode 100644
+index 000000000000..618d97b9b19c
+--- /dev/null
++++ b/helix-term/src/make.rs
+@@ -0,0 +1,129 @@
++use crate::commands::{goto_location, Context};
++use crate::ui::{Picker, PickerColumn};
++use helix_core::diagnostic::Severity;
++use helix_core::regex::RegexBuilder;
++use helix_view::{
++    make::{Entry, FormatType, Location},
++    theme::Style,
++};
++use std::path::PathBuf;
++use tui::text::Span;
++
++// TODO(szulf): figure out how to display messages from the make_list the same way as diagnostics
++// and make it togglable in the config i think(off by default i think)
++
++// TODO(szulf): add keybindings for going to next/prev item in make list
++
++#[derive(Debug, Clone)]
++pub struct MakePickerData {
++    root: PathBuf,
++    hint: Style,
++    info: Style,
++    warning: Style,
++    error: Style,
++}
++
++type MakePicker = Picker<Entry, MakePickerData>;
++
++pub fn make_picker(cx: &Context, root: PathBuf) -> MakePicker {
++    let options = cx.editor.make_list.clone().into_iter();
++
++    let data = MakePickerData {
++        root: root,
++        hint: cx.editor.theme.get("hint"),
++        info: cx.editor.theme.get("info"),
++        warning: cx.editor.theme.get("warning"),
++        error: cx.editor.theme.get("error"),
++    };
++
++    let columns = vec![
++        PickerColumn::new("severity", |entry: &Entry, data: &MakePickerData| {
++            match entry.severity {
++                Severity::Hint => Span::styled("HINT", data.hint),
++                Severity::Info => Span::styled("INFO", data.info),
++                Severity::Warning => Span::styled("WARN", data.warning),
++                Severity::Error => Span::styled("ERROR", data.error),
++            }
++            .into()
++        }),
++        PickerColumn::new("path", |entry: &Entry, data: &MakePickerData| {
++            let path = match entry.location.path.strip_prefix(&data.root) {
++                Ok(path) => path.to_str(),
++                Err(_) => entry.location.path.to_str(),
++            };
++            match path {
++                Some(str) => str.into(),
++                None => "".into(),
++            }
++        }),
++        PickerColumn::new("message", |entry: &Entry, _data: &MakePickerData| {
++            entry.msg.clone().into()
++        }),
++    ];
++
++    Picker::new(columns, 0, options, data, move |cx, item, action| {
++        goto_location(cx, &item.location.path, &item.location.line, action);
++    })
++}
++
++fn parse_with_regex(source: &str, regex: &str) -> Vec<Entry> {
++    let regex = RegexBuilder::new(regex).multi_line(true).build().unwrap();
++    let mut results = Vec::new();
++
++    for cap in regex.captures_iter(source) {
++        let Some(path) = cap.name("path") else {
++            continue;
++        };
++        let Some(line) = cap.name("line") else {
++            continue;
++        };
++
++        let location = Location {
++            path: path.as_str().into(),
++            line: line.as_str().parse::<usize>().unwrap() - 1,
++        };
++
++        let severity = match cap.name("severity").map(|c| c.as_str()).unwrap_or_default() {
++            "warning" => Severity::Warning,
++            "note" | "help" => Severity::Hint,
++            "error" | _ => Severity::Error,
++        };
++
++        let Some(message) = cap.name("message") else {
++            continue;
++        };
++
++        results.push(Entry::new(location, message.as_str().to_owned(), severity));
++    }
++
++    results
++}
++
++fn parse_rust(source: &str) -> Vec<Entry> {
++    parse_with_regex(
++        source,
++        r"^(?P<severity>help|warning|error)(?:\[.+\])?:?\s(?P<message>.+)\n\s+-->\s(?P<path>[^:\n\s]+):(?P<line>\d+):(\d+)$",
++    )
++}
++
++fn parse_gcc(source: &str) -> Vec<Entry> {
++    parse_with_regex(
++        source,
++        r"^(?P<path>[^:\n\s]+)(?::(?P<line>\d+))?(?::\d+)?(?::\([^)]+\))?:\s(?P<severity>error|warning|note)?:?\s?(?P<message>.+)$",
++    )
++}
++
++fn parse_msvc(source: &str) -> Vec<Entry> {
++    parse_with_regex(
++        source,
++        r"^<(?P<path>.+)>\((?P<line>\d+)\):\s(?P<severity>error|warning|note)(?:[^:]+)?:\s(?P<message>.+)$",
++    )
++}
++
++pub fn parse(format_type: &FormatType, source: &str) -> Vec<Entry> {
++    match format_type {
++        FormatType::Rust => parse_rust(source),
++        FormatType::Gcc | FormatType::Clang => parse_gcc(source),
++        FormatType::Msvc => parse_msvc(source),
++    }
++}
+diff --git a/helix-term/src/ui/editor.rs b/helix-term/src/ui/editor.rs
+index b25af107d796..09ba165cc835 100644
+--- a/helix-term/src/ui/editor.rs
++++ b/helix-term/src/ui/editor.rs
+@@ -15,6 +15,7 @@ use crate::{
+ 
+ use helix_core::{
+     diagnostic::NumberOrString,
++    find_workspace,
+     graphemes::{next_grapheme_boundary, prev_grapheme_boundary},
+     movement::Direction,
+     syntax::{self, OverlayHighlights},
+@@ -140,6 +141,7 @@ impl EditorView {
+         }
+ 
+         Self::doc_diagnostics_highlights_into(doc, theme, &mut overlays);
++        Self::doc_makelist_highlights_into(doc, editor, theme, &mut overlays);
+ 
+         if is_focused {
+             if let Some(tabstops) = Self::tabstop_highlights(doc, theme) {
+@@ -185,6 +187,7 @@ impl EditorView {
+         }
+         let width = view.inner_width(doc);
+         let config = doc.config.load();
++
+         let enable_cursor_line = view
+             .diagnostics_handler
+             .show_cursorline_diagnostics(doc, view.id);
+@@ -196,6 +199,7 @@ impl EditorView {
+             inline_diagnostic_config,
+             config.end_of_line_diagnostics,
+         ));
++
+         render_document(
+             surface,
+             inner,
+@@ -459,6 +463,75 @@ impl EditorView {
+         ]);
+     }
+ 
++    pub fn doc_makelist_highlights_into(
++        doc: &Document,
++        editor: &Editor,
++        theme: &Theme,
++        overlay_highlights: &mut Vec<OverlayHighlights>,
++    ) {
++        use helix_core::diagnostic::Severity;
++
++        let get_scope_of = |scope| {
++            theme
++                .find_highlight_exact(scope)
++                // get one of the themes below as fallback values
++                .or_else(|| theme.find_highlight_exact("diagnostic"))
++                .or_else(|| theme.find_highlight_exact("ui.cursor"))
++                .or_else(|| theme.find_highlight_exact("ui.selection"))
++                .expect(
++                    "at least one of the following scopes must be defined in the theme: `diagnostic`, `ui.cursor`, or `ui.selection`",
++                )
++        };
++
++        let mut info_vec = Vec::new();
++        let mut hint_vec = Vec::new();
++        let mut warning_vec = Vec::new();
++        let mut error_vec = Vec::new();
++
++        for entry in &editor.make_list {
++            let vec = match entry.severity {
++                Severity::Hint => &mut hint_vec,
++                Severity::Warning => &mut warning_vec,
++                Severity::Error => &mut error_vec,
++                Severity::Info => &mut info_vec,
++            };
++
++            let current_path = match doc.path() {
++                Some(path) => match path.strip_prefix(find_workspace().0) {
++                    Ok(path) => path,
++                    Err(_) => continue,
++                },
++                None => continue,
++            };
++
++            if current_path == entry.location.path {
++                let text = doc.text().slice(..);
++                let range_start = text.line_to_byte(entry.location.line);
++                let range_end = text.line_to_byte(entry.location.line + 1) - 1;
++                vec.push(range_start..range_end);
++            }
++        }
++
++        overlay_highlights.extend([
++            OverlayHighlights::Homogeneous {
++                highlight: get_scope_of("diagnostic.info"),
++                ranges: info_vec,
++            },
++            OverlayHighlights::Homogeneous {
++                highlight: get_scope_of("diagnostic.hint"),
++                ranges: hint_vec,
++            },
++            OverlayHighlights::Homogeneous {
++                highlight: get_scope_of("diagnostic.warning"),
++                ranges: warning_vec,
++            },
++            OverlayHighlights::Homogeneous {
++                highlight: get_scope_of("diagnostic.error"),
++                ranges: error_vec,
++            },
++        ]);
++    }
++
+     /// Get highlight spans for selections in a document view.
+     pub fn doc_selection_highlights(
+         mode: Mode,
+diff --git a/helix-view/src/editor.rs b/helix-view/src/editor.rs
+index 7f8cff9c3e44..33d7b35061f5 100644
+--- a/helix-view/src/editor.rs
++++ b/helix-view/src/editor.rs
+@@ -9,6 +9,7 @@ use crate::{
+     handlers::Handlers,
+     info::Info,
+     input::KeyEvent,
++    make,
+     register::Registers,
+     theme::{self, Theme},
+     tree::{self, Tree},
+@@ -427,6 +428,8 @@ pub struct Config {
+     pub rainbow_brackets: bool,
+     /// Whether to enable Kitty Keyboard Protocol
+     pub kitty_keyboard_protocol: KittyKeyboardProtocolConfig,
++    /// list of shell command to run when using the :make typed command
++    pub make_cmds: HashMap<PathBuf, make::Command>,
+ }
+ 
+ #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
+@@ -1118,6 +1121,7 @@ impl Default for Config {
+             editor_config: true,
+             rainbow_brackets: false,
+             kitty_keyboard_protocol: Default::default(),
++            make_cmds: HashMap::default(),
+         }
+     }
+ }
+@@ -1219,6 +1223,9 @@ pub struct Editor {
+ 
+     pub mouse_down_range: Option<Range>,
+     pub cursor_cache: CursorCache,
++
++    pub make_cmd: Option<make::Command>,
++    pub make_list: make::List,
+ }
+ 
+ pub type Motion = Box<dyn Fn(&mut Editor)>;
+@@ -1340,6 +1347,8 @@ impl Editor {
+             handlers,
+             mouse_down_range: None,
+             cursor_cache: CursorCache::default(),
++            make_cmd: None,
++            make_list: make::List::new(),
+         }
+     }
+ 
+diff --git a/helix-view/src/gutter.rs b/helix-view/src/gutter.rs
+index 7506e5156374..b2731890e3e6 100644
+--- a/helix-view/src/gutter.rs
++++ b/helix-view/src/gutter.rs
+@@ -1,6 +1,7 @@
+ use std::fmt::Write;
+ 
+ use helix_core::syntax::config::LanguageServerFeature;
++use helix_loader::find_workspace;
+ 
+ use crate::{
+     editor::GutterType,
+@@ -87,6 +88,50 @@ pub fn diagnostic<'doc>(
+     )
+ }
+ 
++pub fn make_list_diagnostic<'doc>(
++    editor: &'doc Editor,
++    doc: &'doc Document,
++    _view: &View,
++    theme: &Theme,
++    _is_focused: bool,
++) -> GutterFn<'doc> {
++    let warning = theme.get("warning");
++    let error = theme.get("error");
++    let info = theme.get("info");
++    let hint = theme.get("hint");
++    let root_path = find_workspace().0;
++
++    Box::new(
++        move |line: usize, _selected: bool, first_visual_line: bool, out: &mut String| {
++            if !first_visual_line {
++                return None;
++            }
++            use helix_core::diagnostic::Severity;
++            let path = match doc.path() {
++                Some(path) => match path.strip_prefix(&root_path) {
++                    Ok(p) => p,
++                    Err(_) => return None,
++                },
++                None => return None,
++            };
++
++            let diagnostics = (&editor.make_list)
++                .into_iter()
++                .filter(|entry| entry.location.path == path && entry.location.line == line);
++
++            diagnostics.max_by_key(|e| e.severity).map(|e| {
++                write!(out, "●").ok();
++                match e.severity {
++                    Severity::Error => error,
++                    Severity::Warning => warning,
++                    Severity::Info => info,
++                    Severity::Hint => hint,
++                }
++            })
++        },
++    )
++}
++
+ pub fn diff<'doc>(
+     _editor: &'doc Editor,
+     doc: &'doc Document,
+@@ -313,6 +358,7 @@ pub fn diagnostics_or_breakpoints<'doc>(
+     theme: &Theme,
+     is_focused: bool,
+ ) -> GutterFn<'doc> {
++    let mut make_list_diagnostics = make_list_diagnostic(editor, doc, view, theme, is_focused);
+     let mut diagnostics = diagnostic(editor, doc, view, theme, is_focused);
+     let mut breakpoints = breakpoints(editor, doc, view, theme, is_focused);
+     let mut execution_pause_indicator = execution_pause_indicator(editor, doc, theme, is_focused);
+@@ -321,6 +367,7 @@ pub fn diagnostics_or_breakpoints<'doc>(
+         execution_pause_indicator(line, selected, first_visual_line, out)
+             .or_else(|| breakpoints(line, selected, first_visual_line, out))
+             .or_else(|| diagnostics(line, selected, first_visual_line, out))
++            .or_else(|| make_list_diagnostics(line, selected, first_visual_line, out))
+     })
+ }
+ 
+diff --git a/helix-view/src/lib.rs b/helix-view/src/lib.rs
+index a7e9f4618c91..4770e82aab14 100644
+--- a/helix-view/src/lib.rs
++++ b/helix-view/src/lib.rs
+@@ -13,6 +13,7 @@ pub mod handlers;
+ pub mod info;
+ pub mod input;
+ pub mod keyboard;
++pub mod make;
+ pub mod register;
+ pub mod theme;
+ pub mod tree;
+diff --git a/helix-view/src/make.rs b/helix-view/src/make.rs
+new file mode 100644
+index 000000000000..d5e7983dce2b
+--- /dev/null
++++ b/helix-view/src/make.rs
+@@ -0,0 +1,98 @@
++use helix_core::diagnostic::Severity;
++use std::ops::{Index, IndexMut};
++use std::path::PathBuf;
++
++#[derive(Debug, Clone, Default)]
++pub struct Location {
++    pub path: PathBuf,
++    pub line: usize,
++}
++
++#[derive(Debug, Clone)]
++pub struct Entry {
++    pub location: Location,
++    pub msg: String,
++    pub severity: Severity,
++}
++
++impl Entry {
++    pub fn new(location: Location, msg: String, severity: Severity) -> Self {
++        Self {
++            location: location,
++            msg: msg,
++            severity: severity,
++        }
++    }
++}
++
++#[derive(Debug, Clone, Default)]
++pub struct List {
++    entries: Vec<Entry>,
++}
++
++impl List {
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    pub fn add(&mut self, entry: Entry) {
++        self.entries.push(entry);
++    }
++
++    pub fn set(&mut self, entries: Vec<Entry>) {
++        self.entries = entries;
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.entries.is_empty()
++    }
++}
++
++impl Index<usize> for List {
++    type Output = Entry;
++
++    fn index(&self, index: usize) -> &Self::Output {
++        &self.entries[index]
++    }
++}
++
++impl IndexMut<usize> for List {
++    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
++        &mut self.entries[index]
++    }
++}
++
++impl IntoIterator for List {
++    type Item = Entry;
++    type IntoIter = std::vec::IntoIter<Self::Item>;
++
++    fn into_iter(self) -> Self::IntoIter {
++        self.entries.into_iter()
++    }
++}
++
++// TODO(szulf): dont know if this is the right way to iterate over this collection without
++// consuming it
++impl<'a> IntoIterator for &'a List {
++    type Item = &'a Entry;
++    type IntoIter = std::slice::Iter<'a, Entry>;
++
++    fn into_iter(self) -> Self::IntoIter {
++        self.entries.iter()
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++#[serde(rename_all = "lowercase")]
++pub enum FormatType {
++    Rust,
++    Gcc,
++    Clang,
++    Msvc,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++pub struct Command {
++    pub command: String,
++    pub format_type: FormatType,
++}

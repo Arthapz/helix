@@ -1,0 +1,76 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index e2ff70e61efc..bf4c4e85be80 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1510,6 +1510,7 @@ dependencies = [
+  "helix-loader",
+  "helix-lsp-types",
+  "helix-stdx",
++ "libc",
+  "log",
+  "parking_lot",
+  "serde",
+@@ -1519,6 +1520,7 @@ dependencies = [
+  "thiserror",
+  "tokio",
+  "tokio-stream",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+diff --git a/helix-lsp/Cargo.toml b/helix-lsp/Cargo.toml
+index 0607479eab62..8a5575af582d 100644
+--- a/helix-lsp/Cargo.toml
++++ b/helix-lsp/Cargo.toml
+@@ -32,3 +32,5 @@ arc-swap = "1"
+ slotmap.workspace = true
+ thiserror.workspace = true
+ sonic-rs.workspace = true
++libc = "0.2"
++windows-sys = "0.61"
+diff --git a/helix-lsp/src/client.rs b/helix-lsp/src/client.rs
+index ebc619e24c88..50bc843b8ba0 100644
+--- a/helix-lsp/src/client.rs
++++ b/helix-lsp/src/client.rs
+@@ -216,9 +216,10 @@ impl Client {
+         Arc<Notify>,
+     )> {
+         // Resolve path to the binary
+-        let cmd = helix_stdx::env::which(cmd)?;
++        let cmd_binary_path = helix_stdx::env::which(cmd)?;
+ 
+-        let process = Command::new(cmd)
++        let mut command = Command::new(cmd_binary_path);
++        command
+             .envs(server_environment)
+             .args(args)
+             .stdin(Stdio::piped())
+@@ -226,10 +227,25 @@ impl Client {
+             .stderr(Stdio::piped())
+             .current_dir(&root_path)
+             // make sure the process is reaped on drop
+-            .kill_on_drop(true)
+-            .spawn();
++            .kill_on_drop(true);
+ 
+-        let mut process = process?;
++        #[cfg(unix)]
++        unsafe {
++            command.pre_exec(|| match libc::setsid() {
++                -1 => Err(std::io::Error::last_os_error()),
++                _ => Ok(()),
++            });
++        }
++
++        #[cfg(windows)]
++        {
++            command.creation_flags(
++                windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP
++                    | windows_sys::Win32::System::Threading::DETACHED_PROCESS,
++            );
++        }
++
++        let mut process = command.spawn()?;
+ 
+         // TODO: do we need bufreader/writer here? or do we use async wrappers on unblock?
+         let writer = BufWriter::new(process.stdin.take().expect("Failed to open stdin"));

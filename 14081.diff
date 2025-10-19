@@ -1,0 +1,98 @@
+diff --git a/languages.toml b/languages.toml
+index 30492e791576..57ee700a23f6 100644
+--- a/languages.toml
++++ b/languages.toml
+@@ -1474,7 +1474,17 @@
+ [[grammar]]
+ name = "lua"
+ source = { git = "https://github.com/tree-sitter-grammars/tree-sitter-lua", rev = "88e446476a1e97a8724dff7a23e2d709855077f2" }
+ 
++[[language]]
++name = "lua-format-string"
++scope = "source.lua-format-string"
++file-types = []
++injection-regex = "lua-format-string"
++
++[[grammar]]
++name = "lua-format-string"
++source = { git = "https://codeberg.org/kpbaks/tree-sitter-lua-format-string", rev = "b667c8cab109df307e1b4d56b0b43f5c4a353533" }
++
+ [[language]]
+ name = "luap"
+ scope = "source.luap"
+diff --git a/runtime/queries/lua-format-string/highlights.scm b/runtime/queries/lua-format-string/highlights.scm
+new file mode 100644
+index 000000000000..02bd09a0f8c0
+--- /dev/null
++++ b/runtime/queries/lua-format-string/highlights.scm
+@@ -0,0 +1,13 @@
++(escaped_percent_sign) @constant.character.escape
++
++(flag) @constant.builtin
++
++(text) @string
++
++(width) @constant.numeric.integer
++(precision) @constant.numeric.float
++
++(conversion_specifier) @type
++
++"." @punctuation.delimiter
++"%" @punctuation.special
+diff --git a/runtime/queries/lua/injections.scm b/runtime/queries/lua/injections.scm
+index fca94d58fab7..1c4b4c09ed47 100644
+--- a/runtime/queries/lua/injections.scm
++++ b/runtime/queries/lua/injections.scm
+@@ -1,3 +1,26 @@
+ ((comment) @injection.content
+  (#set! injection.language "comment")
+  (#set! injection.include-children))
++
++; string.format("format string", ...)
++((function_call
++  name: (dot_index_expression
++    table: (identifier) @_table
++    field: (identifier) @_function)
++  arguments: (arguments
++    .
++    (string
++      content: (string_content) @injection.content)))
++  (#eq? @_table "string")
++  (#eq? @_function "format")
++  (#set! injection.language "lua-format-string"))
++
++; ("format"):format(...)
++((function_call
++  name: (method_index_expression
++    table: (parenthesized_expression
++      (string
++        content: (string_content) @injection.content))
++    method: (identifier) @_function))
++  (#eq? @_function "format")
++  (#set! injection.language "lua-format-string"))
+diff --git a/runtime/queries/luau/injections.scm b/runtime/queries/luau/injections.scm
+index 321c90add371..14eb880c05ca 100644
+--- a/runtime/queries/luau/injections.scm
++++ b/runtime/queries/luau/injections.scm
+@@ -1,2 +1,21 @@
+ ((comment) @injection.content
+  (#set! injection.language "comment"))
++
++; string.format("format string", ...)
++((call_stmt
++  invoked: (var
++    table_name: (name) @_table
++    (key
++      field_name: (name) @_function))
++  (arglist
++    . (string) @injection.content))
++  (#eq? @_table "string")
++  (#eq? @_function "format")
++  (#set! injection.language "lua-format-string"))
++
++; ("format"):format(...)
++((call_stmt
++  method_table: (exp_wrap (string) @injection.content)
++  method_name: (name) @_function)
++  (#eq? @_function "format")
++  (#set! injection.language "lua-format-string"))
